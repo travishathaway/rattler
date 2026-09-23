@@ -5,9 +5,10 @@
 
 use std::{
     borrow::Borrow,
-    collections::{HashSet, VecDeque},
+    collections::{HashMap, HashSet, VecDeque},
     fmt, io,
     marker::PhantomData,
+    ops::Range,
     path::Path,
     sync::LazyLock,
 };
@@ -72,6 +73,29 @@ pub enum PackageFormatSelection {
 
     /// Both .tar.bz2 and .conda packages are used
     Both,
+}
+
+/// A package name together with the set of CEP 44 extras that should be
+/// considered "active" for it when recursively resolving dependencies via
+/// [`SparseRepoData::load_records_recursive`].
+///
+/// A bare [`PackageName`] converts into a `RequestedPackage` with no active
+/// extras, which preserves the previous behavior for existing callers.
+#[derive(Debug, Clone)]
+pub struct RequestedPackage {
+    /// The name of the requested package.
+    pub name: PackageName,
+    /// The extras that should be considered active for this package.
+    pub extras: Vec<String>,
+}
+
+impl From<PackageName> for RequestedPackage {
+    fn from(name: PackageName) -> Self {
+        Self {
+            name,
+            extras: Vec::new(),
+        }
+    }
 }
 
 /// A package that a repodata index lists under its `removed` key. The archive
@@ -517,24 +541,88 @@ impl SparseRepoData {
     /// the packages these records depend on.
     pub fn load_records_recursive<'a>(
         repo_data: impl IntoIterator<Item = &'a SparseRepoData>,
-        package_names: impl IntoIterator<Item = PackageName>,
+        package_names: impl IntoIterator<Item = impl Into<RequestedPackage>>,
         patch_function: Option<fn(&mut PackageRecord)>,
         variant_consolidation: PackageFormatSelection,
     ) -> io::Result<Vec<Vec<RepoDataRecord>>> {
+        // Parses `dependency` (a depends/extra_depends entry, possibly with its own
+        // `[extras=...]` marker), enqueues newly-discovered names, and merges newly
+        // active extras into `active_extras`. Any name that already has entries in
+        // `loaded_ranges` (i.e. was already processed) whose active-extras set grew
+        // is pushed onto `late_walk_queue` so its already-loaded records get
+        // re-scanned for the new extra(s).
+        fn queue_dependency(
+            dependency: &str,
+            seen: &mut HashSet<PackageName>,
+            pending: &mut VecDeque<PackageName>,
+            active_extras: &mut HashMap<PackageName, HashSet<String>>,
+            loaded_ranges: &HashMap<PackageName, Vec<(usize, Range<usize>)>>,
+            late_walk_queue: &mut VecDeque<(PackageName, Vec<String>)>,
+        ) {
+            let (_, extras) = PackageName::name_and_extras_from_matchspec_str(dependency);
+            let dependency_name = PackageName::from_matchspec_str_unchecked(dependency);
+
+            if seen.insert(dependency_name.clone()) {
+                pending.push_back(dependency_name.clone());
+                if !extras.is_empty() {
+                    active_extras
+                        .entry(dependency_name)
+                        .or_default()
+                        .extend(extras);
+                }
+                return;
+            }
+
+            if extras.is_empty() {
+                return;
+            }
+
+            let existing = active_extras.entry(dependency_name.clone()).or_default();
+            let newly_added: Vec<String> = extras
+                .into_iter()
+                .filter(|e| existing.insert(e.clone()))
+                .collect();
+            if !newly_added.is_empty() && loaded_ranges.contains_key(&dependency_name) {
+                late_walk_queue.push_back((dependency_name, newly_added));
+            }
+        }
+
         let repo_data: Vec<_> = repo_data.into_iter().collect();
 
         // Construct the result map
         let mut result: Vec<_> = (0..repo_data.len()).map(|_| Vec::new()).collect();
 
-        // Construct a set of packages that we have seen and have been added to the
-        // pending list.
-        let mut seen: HashSet<PackageName> = package_names.into_iter().collect();
-
+        // Extras that are currently known to be active for a given package name.
+        let mut active_extras: HashMap<PackageName, HashSet<String>> = HashMap::new();
+        // Names that have been discovered (enqueued at some point); prevents
+        // re-enqueueing the same name into `pending` twice.
+        let mut seen: HashSet<PackageName> = HashSet::new();
         // Construct a queue to store packages in that still need to be processed
-        let mut pending: VecDeque<_> = seen.iter().cloned().collect();
+        let mut pending: VecDeque<PackageName> = VecDeque::new();
+        // For each name whose records have already been parsed, the (repo_data
+        // index, range within result[i]) where they live — used to re-scan for
+        // newly-activated extras without re-fetching.
+        let mut loaded_ranges: HashMap<PackageName, Vec<(usize, Range<usize>)>> = HashMap::new();
+
+        for requested in package_names {
+            let RequestedPackage { name, extras } = requested.into();
+            if seen.insert(name.clone()) {
+                pending.push_back(name.clone());
+            }
+            if !extras.is_empty() {
+                active_extras.entry(name).or_default().extend(extras);
+            }
+        }
 
         // Iterate over the list of packages that still need to be processed.
         while let Some(next_package) = pending.pop_front() {
+            let extras_to_walk: Vec<String> = active_extras
+                .get(&next_package)
+                .map(|s| s.iter().cloned().collect())
+                .unwrap_or_default();
+
+            let mut late_walk_queue: VecDeque<(PackageName, Vec<String>)> = VecDeque::new();
+
             for (i, repo_data) in repo_data.iter().enumerate() {
                 let repo_data_packages = repo_data.inner.borrow_repo_data();
                 let base_url = repo_data_packages
@@ -543,7 +631,7 @@ impl SparseRepoData {
                     .and_then(|i| i.base_url.as_deref());
 
                 // Get all records from the repodata
-                let mut records = parse_records(
+                let records = parse_records(
                     Some(&next_package),
                     &repo_data_packages.packages,
                     &repo_data_packages.conda_packages,
@@ -558,17 +646,70 @@ impl SparseRepoData {
                 )?;
 
                 // Iterate over all packages to find recursive dependencies.
-                for record in records.iter() {
+                for record in &records {
                     for dependency in &record.package_record.depends {
-                        let dependency_name = PackageName::from_matchspec_str_unchecked(dependency);
-                        if !seen.contains(&dependency_name) {
-                            pending.push_back(dependency_name.clone());
-                            seen.insert(dependency_name);
+                        queue_dependency(
+                            dependency,
+                            &mut seen,
+                            &mut pending,
+                            &mut active_extras,
+                            &loaded_ranges,
+                            &mut late_walk_queue,
+                        );
+                    }
+                    for extra in &extras_to_walk {
+                        if let Some(deps) = record.package_record.extra_depends.get(extra) {
+                            for dependency in deps {
+                                queue_dependency(
+                                    dependency,
+                                    &mut seen,
+                                    &mut pending,
+                                    &mut active_extras,
+                                    &loaded_ranges,
+                                    &mut late_walk_queue,
+                                );
+                            }
                         }
                     }
                 }
 
-                result[i].append(&mut records);
+                let start = result[i].len();
+                result[i].extend(records);
+                let end = result[i].len();
+                if end > start {
+                    loaded_ranges
+                        .entry(next_package.clone())
+                        .or_default()
+                        .push((i, start..end));
+                }
+            }
+
+            // Drain the late-walk queue to a fixed point: re-scanning an
+            // already-loaded name's records for newly-activated extras can itself
+            // discover further already-loaded names with newly-activated extras
+            // (chained CEP 44 extras), so this must cascade, not just run once.
+            while let Some((name, new_extras)) = late_walk_queue.pop_front() {
+                let Some(ranges) = loaded_ranges.get(&name).cloned() else {
+                    continue;
+                };
+                for (i, range) in ranges {
+                    for record in &result[i][range.clone()] {
+                        for extra in &new_extras {
+                            if let Some(deps) = record.package_record.extra_depends.get(extra) {
+                                for dependency in deps {
+                                    queue_dependency(
+                                        dependency,
+                                        &mut seen,
+                                        &mut pending,
+                                        &mut active_extras,
+                                        &loaded_ranges,
+                                        &mut late_walk_queue,
+                                    );
+                                }
+                            }
+                        }
+                    }
+                }
             }
         }
 
@@ -1308,7 +1449,8 @@ mod test {
     use url::Url;
 
     use super::{
-        PackageFilename, PackageFormatSelection, SparseRepoData, load_repo_data_recursively,
+        PackageFilename, PackageFormatSelection, RequestedPackage, SparseRepoData,
+        load_repo_data_recursively,
     };
 
     fn test_dir() -> PathBuf {
@@ -1642,6 +1784,143 @@ mod test {
         https://example.com/channel/noarch/foo-2.0-0.conda foo-2.0-0.conda https://example.com/channel/
         https://example.com/channel/noarch/foo-3.0-0.conda foo-3.0-0.conda https://example.com/channel/
         ");
+    }
+
+    fn dummy_optional_dependencies_sparse_repo_data() -> SparseRepoData {
+        let channel_config = ChannelConfig::default_with_root_dir(std::env::current_dir().unwrap());
+        let channel = Channel::from_str("dummy-optional-dependencies", &channel_config).unwrap();
+        SparseRepoData::from_file(
+            channel,
+            "noarch",
+            test_dir().join("channels/dummy-optional-dependencies/noarch/repodata.json"),
+            None,
+        )
+        .unwrap()
+    }
+
+    /// Regression test for #2826: `load_records_recursive` must walk
+    /// `extra_depends` for extras that are marked active on a requested
+    /// package, and pull in the packages named there.
+    #[test]
+    fn test_load_records_recursive_walks_active_extras() {
+        let sparse = dummy_optional_dependencies_sparse_repo_data();
+        let foo = PackageName::try_from("foo").unwrap();
+
+        let result = SparseRepoData::load_records_recursive(
+            &[sparse],
+            [RequestedPackage {
+                name: foo,
+                extras: vec!["with-bar".to_string()],
+            }],
+            None,
+            PackageFormatSelection::default(),
+        )
+        .unwrap();
+
+        let names: HashSet<_> = result[0]
+            .iter()
+            .map(|record| record.package_record.name.as_normalized().to_string())
+            .collect();
+        assert!(names.contains("foo"));
+        assert!(
+            names.contains("bar"),
+            "bar (reachable via foo's extra_depends[\"with-bar\"]) should have been loaded, got: {names:?}"
+        );
+    }
+
+    /// A bare [`PackageName`] with no active extras must behave exactly like
+    /// today: only `depends` is walked, `extra_depends` is ignored.
+    #[test]
+    fn test_load_records_recursive_ignores_inactive_extras() {
+        let sparse = dummy_optional_dependencies_sparse_repo_data();
+        let foo = PackageName::try_from("foo").unwrap();
+
+        let result = SparseRepoData::load_records_recursive(
+            &[sparse],
+            [foo],
+            None,
+            PackageFormatSelection::default(),
+        )
+        .unwrap();
+
+        let names: HashSet<_> = result[0]
+            .iter()
+            .map(|record| record.package_record.name.as_normalized().to_string())
+            .collect();
+        assert!(names.contains("foo"));
+        assert!(
+            !names.contains("bar"),
+            "bar should not be loaded when 'with-bar' is not an active extra, got: {names:?}"
+        );
+    }
+
+    /// Late-walk regression test: a package (`b`) requested directly (without
+    /// extras) may have its records parsed *before* another root spec
+    /// activates one of its extras (via `a`'s `extra_depends`). The
+    /// already-loaded `b` records must still be re-scanned for the
+    /// newly-activated extra, cascading to `c`.
+    #[test]
+    fn test_load_records_recursive_late_walk_activates_already_loaded_package() {
+        let json = r#"{
+            "info": {"subdir": "noarch"},
+            "packages": {
+                "a-1-0.tar.bz2": {
+                    "name": "a", "version": "1", "build": "0", "build_number": 0,
+                    "subdir": "noarch",
+                    "extra_depends": {
+                        "foo": ["b[extras=[bar]]"]
+                    }
+                },
+                "b-1-0.tar.bz2": {
+                    "name": "b", "version": "1", "build": "0", "build_number": 0,
+                    "subdir": "noarch",
+                    "extra_depends": {
+                        "bar": ["c"]
+                    }
+                },
+                "c-1-0.tar.bz2": {
+                    "name": "c", "version": "1", "build": "0", "build_number": 0,
+                    "subdir": "noarch"
+                }
+            }
+        }"#;
+        let channel_config = ChannelConfig::default_with_root_dir(std::env::current_dir().unwrap());
+        let channel = Channel::from_str("dummy", &channel_config).unwrap();
+        let sparse =
+            SparseRepoData::from_bytes(channel, "noarch", Bytes::from(json), None).unwrap();
+
+        // Order matters: `b` (plain, no extras) must be processed before `a`'s
+        // "foo" extra activates "bar" on `b`, so that the late-walk path (not
+        // the "still pending" path) is what picks up `c`.
+        let package_names = [
+            RequestedPackage {
+                name: PackageName::try_from("b").unwrap(),
+                extras: Vec::new(),
+            },
+            RequestedPackage {
+                name: PackageName::try_from("a").unwrap(),
+                extras: vec!["foo".to_string()],
+            },
+        ];
+
+        let result = SparseRepoData::load_records_recursive(
+            &[sparse],
+            package_names,
+            None,
+            PackageFormatSelection::default(),
+        )
+        .unwrap();
+
+        let names: HashSet<_> = result[0]
+            .iter()
+            .map(|record| record.package_record.name.as_normalized().to_string())
+            .collect();
+        assert!(names.contains("a"));
+        assert!(names.contains("b"));
+        assert!(
+            names.contains("c"),
+            "c should have been discovered via the late-walk of b's newly-activated 'bar' extra, got: {names:?}"
+        );
     }
 
     #[rstest]

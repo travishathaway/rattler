@@ -2,6 +2,7 @@ use std::{collections::BTreeMap, path::PathBuf, sync::Arc};
 
 use pyo3::{Bound, PyRef, PyResult, Python, pyclass, pymethods};
 
+use rattler_conda_types::PackageName;
 use rattler_repodata_gateway::sparse::{PackageFormatSelection, SparseRepoData};
 
 use crate::channel::PyChannel;
@@ -283,7 +284,7 @@ impl PySparseRepoData {
             .collect::<Result<Vec<_>, _>>()?;
 
         py.detach(move || {
-            let package_names = package_names.into_iter().map(Into::into);
+            let package_names = package_names.into_iter().map(PackageName::from);
             Ok(SparseRepoData::load_records_recursive(
                 repo_data_refs,
                 package_names,

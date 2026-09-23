@@ -166,6 +166,55 @@ async def test_solve_with_repodata() -> None:
     assert len(solved_data) == 2
 
 
+def _optional_dependencies_sparse_repo_data() -> SparseRepoData:
+    data_dir = os.path.join(os.path.dirname(__file__), "../../../test-data/")
+    repodata_path = os.path.join(
+        data_dir, "channels/dummy-optional-dependencies/noarch/repodata.json"
+    )
+    return SparseRepoData(
+        channel=Channel("dummy-optional-dependencies"),
+        subdir="noarch",
+        path=repodata_path,
+    )
+
+
+@pytest.mark.asyncio
+async def test_solve_with_sparse_repodata_resolves_extra_depends() -> None:
+    """Regression test for https://github.com/conda/rattler/issues/2826.
+
+    `foo`'s `with-bar` extra requires `bar <2`. When the extra is requested
+    (via `[extras=[with-bar]]`), `bar` must be pulled in even though it is
+    only reachable through `extra_depends`, not `depends`.
+    """
+    repo_data = _optional_dependencies_sparse_repo_data()
+
+    solved_data = await solve_with_sparse_repodata(
+        [MatchSpec("foo[extras=[with-bar]]")],
+        [repo_data],
+    )
+
+    names = {record.name.normalized for record in solved_data}
+    assert "foo" in names
+    assert "bar" in names
+    bar_record = next(r for r in solved_data if r.name.normalized == "bar")
+    assert str(bar_record.version) == "1"
+
+
+@pytest.mark.asyncio
+async def test_solve_with_sparse_repodata_ignores_inactive_extras() -> None:
+    """Without requesting the `with-bar` extra, `bar` must not be pulled in."""
+    repo_data = _optional_dependencies_sparse_repo_data()
+
+    solved_data = await solve_with_sparse_repodata(
+        [MatchSpec("foo")],
+        [repo_data],
+    )
+
+    names = {record.name.normalized for record in solved_data}
+    assert "foo" in names
+    assert "bar" not in names
+
+
 def python_repodata(tmp_path: Path, python_version: str = "3.12.0") -> SparseRepoData:
     repodata_path = tmp_path / "noarch" / "repodata.json"
     repodata_path.parent.mkdir()

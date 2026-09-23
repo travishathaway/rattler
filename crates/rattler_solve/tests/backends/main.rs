@@ -11,7 +11,7 @@ use rattler_conda_types::{
     ParseMatchSpecOptions, ParseStrictness, RepoData, RepoDataRecord, SolverResult, Version,
     package::{ArchiveIdentifier, CondaArchiveType, DistArchiveIdentifier, DistArchiveType},
 };
-use rattler_repodata_gateway::sparse::{PackageFormatSelection, SparseRepoData};
+use rattler_repodata_gateway::sparse::{PackageFormatSelection, RequestedPackage, SparseRepoData};
 use rattler_solve::{
     ChannelPriority, ExcludeNewer, SolveError, SolveStrategy, SolverImpl, SolverTask,
 };
@@ -240,6 +240,48 @@ fn solve_real_world<T: SolverImpl + Default>(specs: Vec<&str>) -> Vec<String> {
     };
 
     extract_pkgs(pkgs1)
+}
+
+/// Loads packages for the given specs via [`SparseRepoData::load_records_recursive`]
+/// (exercising the same code path as py-rattler's `solve_with_sparse_repodata`)
+/// and solves them. Unlike `solve()`, which loads full repodata eagerly via
+/// `read_repodata`, this exercises CEP 44 `extra_depends` handling in the
+/// sparse loader (regression coverage for #2826).
+fn solve_with_sparse_channel<T: SolverImpl + Default>(
+    repo_path: &str,
+    specs: &[&str],
+) -> Result<SolverResult, SolveError> {
+    let sparse_repo_data = vec![read_sparse_repodata(repo_path)];
+
+    let specs: Vec<_> = specs
+        .iter()
+        .map(|m| {
+            MatchSpec::from_str(m, ParseMatchSpecOptions::lenient().with_extras(true)).unwrap()
+        })
+        .collect();
+
+    let package_names = specs.iter().filter_map(|s| {
+        let name = s.name.clone().into_exact()?;
+        Some(RequestedPackage {
+            name,
+            extras: s.extras.clone().unwrap_or_default(),
+        })
+    });
+
+    let available_packages = SparseRepoData::load_records_recursive(
+        &sparse_repo_data,
+        package_names,
+        None,
+        PackageFormatSelection::default(),
+    )
+    .unwrap();
+
+    let task = SolverTask {
+        specs,
+        ..SolverTask::from_iter(&available_packages)
+    };
+
+    T::default().solve(task)
 }
 
 fn read_real_world_repo_data() -> &'static Vec<SparseRepoData> {
@@ -843,6 +885,7 @@ mod resolvo {
     use super::{
         FromStr, GenericVirtualPackage, PackageBuilder, SimpleSolveTask, SolveError, Version,
         dummy_channel_json_path, installed_package, solve, solve_real_world,
+        solve_with_sparse_channel,
     };
 
     solver_backend_tests!(rattler_solve::resolvo::Solver);
@@ -1353,6 +1396,27 @@ mod resolvo {
               └─ bar <2, which cannot be installed because there are no viable options:
                  └─ bar 1, which conflicts with the versions reported above.
         "###);
+    }
+
+    /// Regression test for #2826: `extra_depends` requirements must be
+    /// resolved when packages are loaded via
+    /// `SparseRepoData::load_records_recursive` (unlike `solve()`, which
+    /// bypasses the sparse loader entirely).
+    #[test]
+    fn test_extra_depends_resolved_via_sparse_repodata() {
+        let result = solve_with_sparse_channel::<rattler_solve::resolvo::Solver>(
+            &dummy_channel_with_optional_dependencies_json_path(),
+            &["foo[extras=[with-bar]]"],
+        )
+        .unwrap();
+
+        let names: Vec<_> = result
+            .records
+            .iter()
+            .map(|r| r.package_record.name.as_normalized().to_string())
+            .collect();
+        assert!(names.contains(&"foo".to_string()), "names: {names:?}");
+        assert!(names.contains(&"bar".to_string()), "names: {names:?}");
     }
 
     // Candidate ordering tests (resolvo-specific)

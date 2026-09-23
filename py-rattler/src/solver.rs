@@ -10,7 +10,7 @@ use pyo3::{
 };
 use pyo3_async_runtimes::tokio::future_into_py;
 use rattler_conda_types::{PackageRecord, ParseStrictness, RepoDataRecord, VersionSpec};
-use rattler_repodata_gateway::sparse::SparseRepoData;
+use rattler_repodata_gateway::sparse::{RequestedPackage, SparseRepoData};
 use rattler_solve::{
     ExcludeNewer, RepoDataIter, SolveStrategy, SolverImpl, SolverTask, resolvo::Solver,
 };
@@ -238,9 +238,13 @@ pub fn py_solve_with_sparse_repodata<'py>(
                 })
                 .collect::<Result<Vec<_>, _>>()?;
 
-            let package_names = specs
-                .iter()
-                .filter_map(|match_spec| match_spec.inner.name.clone().into_exact());
+            let package_names = specs.iter().filter_map(|match_spec| {
+                let name = match_spec.inner.name.clone().into_exact()?;
+                Some(RequestedPackage {
+                    name,
+                    extras: match_spec.inner.extras.clone().unwrap_or_default(),
+                })
+            });
 
             let available_packages = SparseRepoData::load_records_recursive(
                 repo_data_refs,
